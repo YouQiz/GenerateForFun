@@ -47,7 +47,17 @@ async function pageDemoPhase() {
 
   await NF.ready;
   const s = NF.state;
-  ok('title', document.title === 'nailong_play', document.title);
+  ok('title', document.title.indexOf('nailong_play') === 0, document.title);
+  ok('manifest link', !!document.querySelector('link[rel=manifest]'));
+  ok('theme color', !!document.querySelector('meta[name=theme-color]'));
+  ok('og share tags', !!document.querySelector('meta[property="og:title"]') &&
+    !!document.querySelector('meta[property="og:image"]'));
+  const mf = await fetch(document.querySelector('link[rel=manifest]').href)
+    .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  ok('manifest valid', !!(mf && mf.name && mf.start_url && mf.icons && mf.icons.length >= 2),
+    mf ? mf.name + ' / ' + mf.icons.length + ' icons' : 'null');
+  const iconStatus = mf ? await Promise.all(mf.icons.map((i) => fetch(i.src).then((r) => r.ok).catch(() => false))) : [];
+  ok('icons reachable', iconStatus.length > 0 && iconStatus.every(Boolean), iconStatus.join(','));
   ok('demo source', s.source && s.source.kind === 'demo', s.source && s.source.kind);
 
   // 等辅助线稳定 + 自动应用换脸

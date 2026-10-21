@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="nailong_play — 实时摄像头奶龙换脸与视频录制导出">
+  <title>nailong_play</title>
+  <link rel="icon" href="assets/nailong-face.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ==================== 上半部分：视频预览区 ==================== -->
+  <main id="stage">
+    <div id="viewport">
+      <!-- 真实摄像头画面（不直接显示，逐帧绘制到画布上） -->
+      <video id="cam" playsinline autoplay muted></video>
+
+      <!-- 画面 + 奶龙贴纸 + 辅助线 全部绘制在这里 -->
+      <canvas id="view" aria-label="换脸预览"></canvas>
+
+      <!-- 顶部状态条 -->
+      <div id="stage-hud">
+        <div id="rec-badge" class="badge hidden">
+          <span class="rec-dot"></span><span>REC</span><span id="rec-time">00:00</span>
+        </div>
+        <div id="face-badge" class="badge">等待摄像头…</div>
+        <button id="btn-auto" class="badge badge-btn hidden" type="button" title="改由自动检测重新定位辅助线">恢复自动对位</button>
+      </div>
+
+      <!-- 摄像头异常 / 权限引导 -->
+      <div id="stage-overlay" class="overlay hidden">
+        <div class="overlay-card">
+          <div class="overlay-icon" id="ov-icon">📷</div>
+          <h2 id="ov-title">摄像头未开启</h2>
+          <p id="ov-desc">请允许浏览器使用摄像头后重试。</p>
+          <div class="overlay-actions">
+            <button class="btn is-active" id="ov-retry" type="button">重试</button>
+            <button class="btn" id="ov-demo" type="button">使用演示画面</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="toasts" aria-live="polite"></div>
+    </div>
+  </main>
+
+  <!-- ==================== 下半部分：控制面板 ==================== -->
+  <section id="panel">
+
+    <div class="panel-row">
+
+      <!-- 左侧：功能按钮组 -->
+      <div class="panel-left" id="btn-group">
+        <button class="btn is-active" id="btn-works" type="button">我的换脸作品</button>
+        <button class="btn" id="btn-switch" type="button">切换换脸</button>
+        <button class="btn" id="btn-record" type="button">开始录制</button>
+        <button class="btn" id="btn-export" type="button">导出</button>
+      </div>
+
+      <!-- 中间：参数设置区 -->
+      <div class="panel-center" id="param-group">
+        <div class="param">
+          <div class="param-head">
+            <label class="param-label" for="r-smooth">平滑度</label>
+            <span class="param-value" id="v-smooth">5</span>
+          </div>
+          <input type="range" id="r-smooth" min="1" max="10" step="1" value="5" aria-label="平滑度">
+        </div>
+
+        <div class="param">
+          <div class="param-head">
+            <label class="param-label" for="r-fps">帧数</label>
+            <span class="param-value" id="v-fps">25 FPS</span>
+          </div>
+          <input type="range" id="r-fps" min="15" max="30" step="1" value="25" aria-label="帧数">
+        </div>
+
+        <div class="param">
+          <div class="param-head">
+            <label class="param-label" for="r-align">对齐</label>
+            <span class="param-value" id="v-align">23</span>
+          </div>
+          <input type="range" id="r-align" min="10" max="50" step="1" value="23" aria-label="对齐">
+        </div>
+      </div>
+
+      <!-- 右侧：移除强度 -->
+      <div class="panel-right" id="remove-group">
+        <div class="remove-head">
+          <span class="remove-label">移除强度</span>
+          <span class="remove-value" id="v-remove">100%</span>
+        </div>
+        <input type="range" id="r-remove" class="strength" min="0" max="100" step="1" value="100" aria-label="移除强度">
+      </div>
+
+    </div>
+
+    <p class="panel-tip" id="panel-tip">
+      正对摄像头，等黄色辅助线稳定约 1 秒后会自动戴上奶龙脸；拖动四角可微调位置，按「R」开始/停止录制。
+    </p>
+
+  </section>
+
+  <!-- ==================== 我的换脸作品 ==================== -->
+  <div id="gallery" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="gallery-title">
+    <div class="sheet-card">
+      <div class="sheet-head">
+        <h2 id="gallery-title">我的换脸作品</h2>
+        <span class="sheet-sub" id="gallery-count"></span>
+        <button class="icon-btn" id="gallery-close" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-body">
+        <div id="gallery-empty" class="empty-state hidden">
+          <div class="empty-emoji">🐲</div>
+          <p>还没有换脸作品，快去录制吧！</p>
+          <button class="btn is-active" id="gallery-go-record" type="button">去录制</button>
+        </div>
+        <div id="gallery-grid" class="gallery-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 切换换脸 ==================== -->
+  <div id="templates" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="tpl-title">
+    <div class="sheet-card sheet-small">
+      <div class="sheet-head">
+        <h2 id="tpl-title">切换换脸</h2>
+        <button class="icon-btn" id="tpl-close" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-body">
+        <div class="tpl-grid" id="tpl-grid"></div>
+        <p class="sheet-note">
+          内置「奶龙」模板；也可以点「导入照片」用自己的图片做贴纸。<br>
+          建议使用<b>透明底或纯色底</b>的大头照，导入后会自动抠掉背景、裁掉多余部分并适配人脸大小。
+        </p>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn" id="tpl-done" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 本地图片选择（隐藏，由「导入照片」触发） -->
+  <input type="file" id="photo-input" accept="image/*" hidden>
+
+  <noscript>
+    <p style="padding:24px;color:#fff">nailong_play 需要启用 JavaScript 才能运行。</p>
+  </noscript>
+
+  <script src="app.js"></script>
+</body>
+</html>

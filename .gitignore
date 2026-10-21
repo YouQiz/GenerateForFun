@@ -1,0 +1,12 @@
+# 系统 / 编辑器垃圾文件
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+
+# 日志
+*.log
+
+# 依赖（本项目零依赖，留作备用）
+node_modules/

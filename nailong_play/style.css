@@ -140,6 +140,16 @@ body {
 
 .badge-btn:hover { background: rgba(255, 215, 0, 0.16); }
 
+/* 手势控制开启态 */
+#btn-hand.is-on {
+  background: #7cff9b;
+  border-color: #7cff9b;
+  color: #10331d;
+  font-weight: 600;
+}
+
+#btn-hand.is-on:hover { background: #93ffae; }
+
 #rec-badge {
   color: #ff6b6b;
   font-weight: 700;

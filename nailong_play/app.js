@@ -122,6 +122,13 @@
     lastInteraction: 0,
     lastSeenAt: 0,         // 最近一次检测到人脸的时间
 
+    handControl: false,    // 手势控制开关
+    hands: [],             // 当前检测到的指尖（归一化）
+    handTracker: null,
+    faceQuad: null,        // 最近一次人脸框（手势模式下用于把手部检测里的脸抹掉）
+    faceTick: 0,
+    handSeenAt: 0,
+
     recording: false,
     recorder: null,
     chunks: [],
@@ -637,6 +644,63 @@
   /* ============================================================
    * 6. 离线人脸定位
    * ============================================================ */
+  /* ============================================================
+   * 6.0 肤色分割公用工具（人脸 / 手部定位共用）
+   * ============================================================ */
+
+  /** 肤色判定（RGB + YCbCr + 亮度三重条件，兼顾浅/深肤色，排除头发/眉毛） */
+  function isSkin(r, g, b) {
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    if (max < 42 || max - min < 13) return false;
+    // 亮度下限：黑发、深色眉毛同样能通过色度条件，必须靠亮度排除
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (lum < 52) return false;
+    if (!(r > g && g > b * 0.8)) return false;
+    const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+    const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+    return cb >= 76 && cb <= 133 && cr >= 132 && cr <= 182;
+  }
+
+  /** 四连通域标记，返回面积/外接框/一二阶矩 */
+  function components(mask, W, H) {
+    const seen = new Uint8Array(mask.length);
+    const stack = new Int32Array(mask.length);
+    const out = [];
+
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i] || seen[i]) continue;
+      let sp = 0;
+      stack[sp++] = i;
+      seen[i] = 1;
+
+      let area = 0;
+      let x0 = W, x1 = -1, y0 = H, y1 = -1;
+      let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+
+      while (sp > 0) {
+        const p = stack[--sp];
+        const x = p % W;
+        const y = (p - x) / W;
+
+        area++;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+
+        if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack[sp++] = p - 1; }
+        if (x < W - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack[sp++] = p + 1; }
+        if (y > 0 && mask[p - W] && !seen[p - W]) { seen[p - W] = 1; stack[sp++] = p - W; }
+        if (y < H - 1 && mask[p + W] && !seen[p + W]) { seen[p + W] = 1; stack[sp++] = p + W; }
+      }
+
+      out.push({ area, x0, x1, y0, y1, sx, sy, sxx, syy, sxy });
+    }
+    return out;
+  }
+
   /**
    * 人脸定位器工厂：每次调用得到一个相互独立的追踪实例
    * （互不干扰的 prev 状态，便于同时存在预览与单元测试）
@@ -644,58 +708,7 @@
   const createFaceTracker = (function () {
     const MAX_SIDE = 208;
 
-    /** 肤色判定（RGB + YCbCr + 亮度三重条件，兼顾浅/深肤色，排除头发/眉毛） */
-    function isSkin(r, g, b) {
-      const max = Math.max(r, g, b);
-      const min = Math.min(r, g, b);
-      if (max < 42 || max - min < 13) return false;
-      // 亮度下限：黑发、深色眉毛同样能通过色度条件，必须靠亮度排除
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      if (lum < 52) return false;
-      if (!(r > g && g > b * 0.8)) return false;
-      const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-      const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-      return cb >= 76 && cb <= 133 && cr >= 132 && cr <= 182;
-    }
-
-    /** 四连通域标记，返回面积/外接框/一二阶矩 */
-    function components(mask, W, H) {
-      const seen = new Uint8Array(mask.length);
-      const stack = new Int32Array(mask.length);
-      const out = [];
-
-      for (let i = 0; i < mask.length; i++) {
-        if (!mask[i] || seen[i]) continue;
-        let sp = 0;
-        stack[sp++] = i;
-        seen[i] = 1;
-
-        let area = 0;
-        let x0 = W, x1 = -1, y0 = H, y1 = -1;
-        let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-
-        while (sp > 0) {
-          const p = stack[--sp];
-          const x = p % W;
-          const y = (p - x) / W;
-
-          area++;
-          if (x < x0) x0 = x;
-          if (x > x1) x1 = x;
-          if (y < y0) y0 = y;
-          if (y > y1) y1 = y;
-          sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
-
-          if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack[sp++] = p - 1; }
-          if (x < W - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack[sp++] = p + 1; }
-          if (y > 0 && mask[p - W] && !seen[p - W]) { seen[p - W] = 1; stack[sp++] = p - W; }
-          if (y < H - 1 && mask[p + W] && !seen[p + W]) { seen[p + W] = 1; stack[sp++] = p + W; }
-        }
-
-        out.push({ area, x0, x1, y0, y1, sx, sy, sxx, syy, sxy });
-      }
-      return out;
-    }
+    // isSkin / components 见文件上部「6.0 肤色分割公用工具」
 
     /** 给连通域打分，挑最像“人脸”的一块 */
     function pickFace(comps, W, H, prev) {
@@ -1015,6 +1028,256 @@
   state.tracker = createFaceTracker();
 
   /* ============================================================
+   * 6.5 手部定位（肤色分割 + 距离变换，用双手控制换脸自选框）
+   * ============================================================ */
+  const createHandTracker = (function () {
+    const MAX_SIDE = 160;
+
+    /** 倒角距离变换：每个前景像素到最近背景的距离（单位≈像素） */
+    function distanceTransform(mask, W, H) {
+      const INF = 1e6;
+      const d = new Float32Array(W * H);
+      for (let i = 0; i < d.length; i++) d[i] = mask[i] ? INF : 0;
+      const S = 1.4142;
+
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const i = y * W + x;
+          if (!d[i]) continue;
+          let m = d[i];
+          if (x > 0 && d[i - 1] + 1 < m) m = d[i - 1] + 1;
+          if (y > 0) {
+            if (d[i - W] + 1 < m) m = d[i - W] + 1;
+            if (x > 0 && d[i - W - 1] + S < m) m = d[i - W - 1] + S;
+            if (x < W - 1 && d[i - W + 1] + S < m) m = d[i - W + 1] + S;
+          }
+          d[i] = m;
+        }
+      }
+      for (let y = H - 1; y >= 0; y--) {
+        for (let x = W - 1; x >= 0; x--) {
+          const i = y * W + x;
+          if (!d[i]) continue;
+          let m = d[i];
+          if (x < W - 1 && d[i + 1] + 1 < m) m = d[i + 1] + 1;
+          if (y < H - 1) {
+            if (d[i + W] + 1 < m) m = d[i + W] + 1;
+            if (x < W - 1 && d[i + W + 1] + S < m) m = d[i + W + 1] + S;
+            if (x > 0 && d[i + W - 1] + S < m) m = d[i + W - 1] + S;
+          }
+          d[i] = m;
+        }
+      }
+      return d;
+    }
+
+    function create() {
+      const work = document.createElement('canvas');
+      const wctx = work.getContext('2d', { willReadFrequently: true });
+      let prev = null; // 上一帧的指尖位置，用于平滑
+
+      /**
+       * @param source 视频或画布
+       * @param faceQuad 归一化人脸四角，用于把脸从肤色掩码里抹掉（可为 null）
+       * @param mirror 是否镜像分析
+       * @returns {{hands: Array, dual: null|{cx:number,cy:number,span:number,angle:number}}}
+       */
+      function analyze(source, faceQuad, mirror) {
+        const empty = { hands: [], dual: null };
+        const sw = source.videoWidth || source.width;
+        const sh = source.videoHeight || source.height;
+        if (!sw || !sh) return empty;
+
+        const k = MAX_SIDE / Math.max(sw, sh);
+        const W = Math.max(48, Math.round(sw * k));
+        const H = Math.max(36, Math.round(sh * k));
+        if (work.width !== W || work.height !== H) { work.width = W; work.height = H; }
+
+        wctx.setTransform(1, 0, 0, 1, 0, 0);
+        wctx.clearRect(0, 0, W, H);
+        if (mirror) wctx.setTransform(-1, 0, 0, 1, W, 0);
+        wctx.drawImage(source, 0, 0, W, H);
+        wctx.setTransform(1, 0, 0, 1, 0, 0);
+
+        let data;
+        try {
+          data = wctx.getImageData(0, 0, W, H).data;
+        } catch (e) {
+          return empty;
+        }
+
+        const mask = new Uint8Array(W * H);
+        for (let p = 0, i = 0; p < mask.length; p++, i += 4) {
+          if (isSkin(data[i], data[i + 1], data[i + 2])) mask[p] = 1;
+        }
+
+        // 抹掉人脸区域（外扩 12%），否则脸会被当成“手”
+        if (faceQuad) {
+          const xs = faceQuad.map((q) => q.x * W);
+          const ys = faceQuad.map((q) => q.y * H);
+          const fx0 = Math.min.apply(null, xs);
+          const fx1 = Math.max.apply(null, xs);
+          const fy0 = Math.min.apply(null, ys);
+          const fy1 = Math.max.apply(null, ys);
+          const ax0 = Math.max(0, Math.floor(fx0 - (fx1 - fx0) * 0.12));
+          const ax1 = Math.min(W - 1, Math.ceil(fx1 + (fx1 - fx0) * 0.12));
+          const ay0 = Math.max(0, Math.floor(fy0 - (fy1 - fy0) * 0.12));
+          const ay1 = Math.min(H - 1, Math.ceil(fy1 + (fy1 - fy0) * 0.12));
+          for (let y = ay0; y <= ay1; y++) {
+            for (let x = ax0; x <= ax1; x++) mask[y * W + x] = 0;
+          }
+        }
+
+        const comps = components(mask, W, H);
+        const cands = [];
+        for (let i = 0; i < comps.length; i++) {
+          const c = comps[i];
+          const bw = c.x1 - c.x0 + 1;
+          const bh = c.y1 - c.y0 + 1;
+          if (c.area < W * H * 0.004 || c.area > W * H * 0.3) continue;
+          const solidity = c.area / (bw * bh);
+          if (solidity < 0.28) continue;
+          const aspect = bw / bh;
+          if (aspect < 0.22 || aspect > 4.5) continue;
+          cands.push(c);
+        }
+        if (!cands.length) {
+          prev = null;
+          return empty;
+        }
+
+        const dt = distanceTransform(mask, W, H);
+        const hands = [];
+
+        for (let ci = 0; ci < cands.length; ci++) {
+          const c = cands[ci];
+          let palmI = -1;
+          let palmD = 0;
+          for (let y = c.y0; y <= c.y1; y++) {
+            for (let x = c.x0; x <= c.x1; x++) {
+              const i = y * W + x;
+              if (dt[i] > palmD) { palmD = dt[i]; palmI = i; }
+            }
+          }
+          if (palmI < 0 || palmD < 3) continue;
+
+          const px = palmI % W;
+          const py = (palmI - (palmI % W)) / W;
+          const cap = palmD * 2.4; // 只在这一圈里找指尖，避免把手臂末端当成指尖
+          let tipD = 0;
+          let tipI = -1;
+          for (let y = c.y0; y <= c.y1; y++) {
+            for (let x = c.x0; x <= c.x1; x++) {
+              const i = y * W + x;
+              if (!mask[i]) continue;
+              const dx = x - px;
+              const dy = y - py;
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              if (dist <= cap && dist > tipD) { tipD = dist; tipI = i; }
+            }
+          }
+          if (tipI < 0) continue;
+
+          const ext = tipD / palmD;
+          if (ext < 1.2) continue; // 没有“伸出的手指”，多半是手臂或其它肤色块
+
+          const tx = tipI % W;
+          const ty = (tipI - (tipI % W)) / W;
+          hands.push({
+            x: tx / W,
+            y: ty / H,
+            palmX: px / W,
+            palmY: py / H,
+            r: palmD / W,
+            ext,
+            score: (c.area / (W * H)) * Math.min(2, ext),
+          });
+        }
+
+        if (!hands.length) {
+          prev = null;
+          return empty;
+        }
+
+        // 优先取“水平分开最远”的两只（脖子/前臂等误检通常靠得很近）
+        hands.sort((a, b) => b.score - a.score);
+        const pool = hands.slice(0, 4);
+        let picked;
+        let bestSep = 0;
+        let bestPair = null;
+        for (let i = 0; i < pool.length; i++) {
+          for (let j = i + 1; j < pool.length; j++) {
+            const sep = Math.abs(pool[i].x - pool[j].x);
+            if (sep > bestSep) { bestSep = sep; bestPair = [pool[i], pool[j]]; }
+          }
+        }
+        if (bestPair && bestSep > 0.12) picked = bestPair;
+        else picked = [pool[0]];
+
+        // 平滑（按 x 排序后再插值，避免两只手互换顺序时跳变）
+        picked.sort((a, b) => a.x - b.x);
+        if (prev && prev.length === picked.length) {
+          for (let i = 0; i < picked.length; i++) {
+            const d = Math.hypot(picked[i].x - prev[i].x, picked[i].y - prev[i].y);
+            const t = d > 0.25 ? 1 : 0.55;
+            picked[i].x = prev[i].x + (picked[i].x - prev[i].x) * t;
+            picked[i].y = prev[i].y + (picked[i].y - prev[i].y) * t;
+          }
+        }
+        prev = picked.map((h) => ({ x: h.x, y: h.y }));
+
+        let dual = null;
+        if (picked.length === 2) {
+          const a = picked[0];
+          const b = picked[1];
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          dual = {
+            cx: (a.x + b.x) / 2,
+            cy: (a.y + b.y) / 2,
+            span: Math.hypot(dx, dy),
+            angle: Math.atan2(dy, dx),
+          };
+        }
+
+        return { hands: picked, dual };
+      }
+
+      function reset() {
+        prev = null;
+      }
+
+      return { analyze, reset, canvas: work };
+    }
+
+    return create;
+  })();
+
+  state.handTracker = createHandTracker();
+
+  /** 由双手指尖推出自选框四角：中点=位置，间距=大小，连线角度=旋转 */
+  function quadFromHands(dual, aspect) {
+    const w = clamp(dual.span * 0.75, 0.1, 0.95);
+    const h = clamp(w * (aspect || 1.22), 0.12, 0.98);
+    const cx = clamp(dual.cx, 0.05, 0.95);
+    const cy = clamp(dual.cy, 0.05, 0.95);
+    const ang = clamp(dual.angle, -0.6, 0.6);
+    const cos = Math.cos(ang);
+    const sin = Math.sin(ang);
+    const hw = w / 2;
+    const hh = h / 2;
+    return [
+      [-hw, -hh],
+      [hw, -hh],
+      [hw, hh],
+      [-hw, hh],
+    ].map(([dx, dy]) => ({
+      x: clamp(cx + dx * cos - dy * sin, 0, 1),
+      y: clamp(cy + dx * sin + dy * cos, 0, 1),
+    }));
+  }
+
+  /* ============================================================
    * 7. 演示画面（没有摄像头时也能预览/试用）
    * ============================================================ */
   class DemoSource {
@@ -1153,6 +1416,40 @@
 
       g.restore();
       g.restore();
+
+      // 手势控制开启时，画两只手，方便没摄像头时演示
+      if (state.handControl) {
+        const open = 0.5 + 0.5 * Math.sin(s * 0.6);
+        const lift = Math.sin(s * 1.1) * 12;
+        const tiltHand = Math.sin(s * 0.6) * 0.18;
+        const hx = VW * (0.16 + 0.07 * open);
+        const hy = VH * 0.68 + lift;
+        this.drawHand(hx, hy, tiltHand, false);
+        this.drawHand(VW - hx, hy + Math.cos(s * 0.9) * 8, -tiltHand, true);
+      }
+    }
+
+    /** 一只手：手掌 + 食指 + 拇指（肤色，够手部定位识别出指尖） */
+    drawHand(x, y, angle, flip) {
+      const g = this.g;
+      g.save();
+      g.translate(x, y);
+      g.rotate(angle);
+      g.fillStyle = '#e8b48f';
+      // 手掌
+      roundRectPath(g, -32, -20, 64, 96, 28);
+      g.fill();
+      // 食指（朝上）
+      roundRectPath(g, -11, -104, 26, 96, 13);
+      g.fill();
+      // 拇指
+      g.save();
+      g.translate(flip ? -28 : 28, 12);
+      g.rotate(flip ? 0.55 : -0.55);
+      roundRectPath(g, -11, -30, 22, 62, 11);
+      g.fill();
+      g.restore();
+      g.restore();
     }
   }
 
@@ -1231,6 +1528,55 @@
       g.textBaseline = 'middle';
       g.fillText(text, bx + bw / 2, by + bh / 2 + 0.5);
     }
+
+    g.restore();
+  }
+
+  /** 手势控制的指尖标记：两个圆点 + 连线 + 状态提示 */
+  function drawHandPoints(g, m, ts) {
+    const hands = state.hands || [];
+    const pts = hands.map((h) => ({ x: m.x + h.x * m.w, y: m.y + h.y * m.h }));
+    const pulse = (Math.sin(ts / 220) + 1) / 2;
+
+    g.save();
+
+    if (pts.length === 2) {
+      g.setLineDash([6, 6]);
+      g.lineWidth = 2;
+      g.strokeStyle = 'rgba(124, 255, 155, 0.85)';
+      g.beginPath();
+      g.moveTo(pts[0].x, pts[0].y);
+      g.lineTo(pts[1].x, pts[1].y);
+      g.stroke();
+      g.setLineDash([]);
+    }
+
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      g.beginPath();
+      g.arc(p.x, p.y, 9 + pulse * 3, 0, TAU);
+      g.strokeStyle = 'rgba(124, 255, 155, 0.9)';
+      g.lineWidth = 2;
+      g.stroke();
+      g.beginPath();
+      g.arc(p.x, p.y, 3.5, 0, TAU);
+      g.fillStyle = '#7cff9b';
+      g.fill();
+    }
+
+    const txt = hands.length === 2 ? '双手控制中' : hands.length === 1 ? '再举起另一只手' : '举起双手手指';
+    g.font = '12px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+    const tw = g.measureText(txt).width;
+    const bw = tw + 24;
+    const bx = clamp(m.x + m.w / 2 - bw / 2, 8, m.x + m.w - bw - 8);
+    const by = m.y + 16;
+    g.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    roundRectPath(g, bx, by, bw, 26, 13);
+    g.fill();
+    g.fillStyle = '#c9ffd6';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(txt, bx + bw / 2, by + 13.5);
 
     g.restore();
   }
@@ -1324,12 +1670,15 @@
     state.guideAlpha = lerp(state.guideAlpha, target, 0.18);
     if (state.quad) {
       const pts = quadToView(state.quad, m);
-      const hint = !state.manual && !state.effect;
+      const hint = !state.manual && !state.effect && !state.handControl;
       drawGuides(g, pts, state.guideAlpha, ts, hint);
     }
 
+    // 手势控制：画出指尖与连线
+    if (state.handControl) drawHandPoints(g, m, ts);
+
     // 长时间没检测到人脸时给个提示
-    if (!state.face && state.source && ts - (state.lastSeenAt || 0) > 2200) {
+    if (!state.face && !state.handControl && state.source && ts - (state.lastSeenAt || 0) > 2200) {
       g.save();
       g.globalAlpha = 0.85;
       g.fillStyle = 'rgba(0, 0, 0, 0.45)';
@@ -1347,42 +1696,82 @@
   }
 
   /** 用检测结果更新四角 */
+  /** 手势模式：双手指尖 → 自选框（位置 / 大小 / 旋转） */
+  function updateHandTracking(ts) {
+    const src = state.source;
+    if (!src) return;
+
+    // 人脸框仍然低频更新，只用于把手部检测里的脸抹掉
+    if (ts - state.faceTick > 250) {
+      state.faceTick = ts;
+      const det = state.tracker.detect(src.el, true);
+      if (det) state.faceQuad = rectToQuad(det);
+    }
+
+    const res = state.handTracker.analyze(src.el, state.faceQuad, true);
+    state.hands = res.hands;
+
+    if (res.dual) {
+      const aspect = currentQuadAspect();
+      const next = quadFromHands(res.dual, aspect);
+      state.quad = state.quad ? lerpQuad(state.quad, next, 0.6) : next;
+      state.handSeenAt = ts;
+      if (!state.quadSettledAt) state.quadSettledAt = ts;
+    }
+  }
+
+  /** 当前框的高宽比（拿不到就用默认的脸型比例） */
+  function currentQuadAspect() {
+    const q = state.quad;
+    if (!q) return 1.22;
+    const w = (dist(q[0], q[1]) + dist(q[3], q[2])) / 2;
+    const h = (dist(q[0], q[3]) + dist(q[1], q[2])) / 2;
+    if (w < 0.01 || h < 0.01) return 1.22;
+    return clamp(h / w, 0.8, 2);
+  }
+
   function updateTracking(ts) {
     const src = state.source;
     if (!src) return;
 
-    const det = state.tracker.detect(src.el, true);
-    state.lastSeenAt = state.lastSeenAt || 0;
-
-    if (det) {
-      state.face = true;
-      state.lastSeenAt = ts;
-
-      if (!state.manual) {
-        const next = rectToQuad(det);
-        if (!state.quad) {
-          state.quad = next;
-          state.quadSettledAt = ts;
-        } else {
-          // 大幅位移（换人 / 快速移动）时直接吸附，避免慢慢飘过去
-          const px = (state.quad[0].x + state.quad[2].x) / 2;
-          const py = (state.quad[0].y + state.quad[2].y) / 2;
-          const nx = (next[0].x + next[2].x) / 2;
-          const ny = (next[0].y + next[2].y) / 2;
-          const jump = Math.hypot(nx - px, ny - py);
-          state.quad = lerpQuad(state.quad, next, jump > 0.12 ? 1 : 0.72);
-        }
-      }
+    if (state.handControl) {
+      updateHandTracking(ts);
     } else {
-      state.face = false;
-      // 丢失超过 1 秒就丢掉历史位置，重新出现时能立刻锁到新位置
-      if (ts - state.lastSeenAt > 1000) state.tracker.reset();
+      const det = state.tracker.detect(src.el, true);
+      state.lastSeenAt = state.lastSeenAt || 0;
+
+      if (det) {
+        state.face = true;
+        state.lastSeenAt = ts;
+        state.faceQuad = rectToQuad(det);
+
+        if (!state.manual) {
+          const next = state.faceQuad;
+          if (!state.quad) {
+            state.quad = next;
+            state.quadSettledAt = ts;
+          } else {
+            // 大幅位移（换人 / 快速移动）时直接吸附，避免慢慢飘过去
+            const px = (state.quad[0].x + state.quad[2].x) / 2;
+            const py = (state.quad[0].y + state.quad[2].y) / 2;
+            const nx = (next[0].x + next[2].x) / 2;
+            const ny = (next[0].y + next[2].y) / 2;
+            const jump = Math.hypot(nx - px, ny - py);
+            state.quad = lerpQuad(state.quad, next, jump > 0.12 ? 1 : 0.72);
+          }
+        }
+      } else {
+        state.face = false;
+        // 丢失超过 1 秒就丢掉历史位置，重新出现时能立刻锁到新位置
+        if (ts - state.lastSeenAt > 1000) state.tracker.reset();
+      }
     }
 
     // 辅助线静止约 1 秒后自动应用换脸效果
     if (state.quad && !state.effect) {
       const idle = ts - Math.max(state.quadSettledAt, state.lastInteraction);
-      if (idle > APPLY_DELAY && state.face) {
+      const ready = state.handControl ? state.hands.length === 2 : state.face;
+      if (idle > APPLY_DELAY && ready) {
         state.effect = true;
         toastOnce('effect', '换脸效果已应用，可以开始录制啦', 'ok');
       }
@@ -1492,6 +1881,8 @@
   }
 
   function onPointerDown(e) {
+    // 手势控制时由手部接管，四角不可拖
+    if (state.handControl) return;
     if (!state.quad || !state.source || e.button !== 0) return;
     const p = localPoint(e);
     const pts = quadToView(state.quad, state.map);
@@ -2308,12 +2699,37 @@
     toast(msg, type);
   }
 
+  /** 手势控制开关：双手手指控制自选框 */
+  function toggleHandControl() {
+    state.handControl = !state.handControl;
+    el.btnHand.classList.toggle('is-on', state.handControl);
+    el.btnHand.textContent = state.handControl ? '✋ 手势控制中' : '✋ 手势控制';
+    state.hands = [];
+    state.handTracker.reset();
+    state.faceQuad = state.quad ? state.quad.map((p) => ({ ...p })) : null;
+
+    if (state.handControl) {
+      state.manual = false;
+      state.faceTick = 0;
+      el.btnAuto.classList.add('hidden');
+      toast('举起双手并伸出食指：两手间距控制大小、两手位置控制位置、手的倾斜控制旋转', 'ok', 4200);
+    } else {
+      state.tracker.reset();
+      toast('已切回自动人脸对位');
+    }
+    updateFaceBadge();
+  }
+
   function updateFaceBadge() {
     const b = el.faceBadge;
     let text;
     let cls = '';
 
-    if (!state.source) {
+    if (state.handControl) {
+      const two = state.hands.length === 2;
+      text = two ? '手势控制 · 双手' : '手势控制 · 找手中';
+      cls = two ? 'is-ok' : 'is-warn';
+    } else if (!state.source) {
       text = '等待摄像头…';
     } else if (state.source.kind === 'demo') {
       text = state.face ? '演示画面 · 已定位' : '演示画面';
@@ -2436,6 +2852,7 @@
     el.recBadge = $('rec-badge');
     el.recTime = $('rec-time');
     el.btnAuto = $('btn-auto');
+    el.btnHand = $('btn-hand');
     el.toasts = $('toasts');
 
     el.overlay = $('stage-overlay');
@@ -2483,6 +2900,8 @@
       el.btnAuto.classList.add('hidden');
       toast('已恢复自动对位');
     });
+
+    el.btnHand.addEventListener('click', toggleHandControl);
 
     $('gallery-close').addEventListener('click', closeGallery);
     $('gallery-go-record').addEventListener('click', () => {
@@ -2610,6 +3029,8 @@
       loadImageFromFile,
     },
     createFaceTracker,
+    createHandTracker,
+    quadFromHands,
     composite,
     getSticker,
     rectToQuad,

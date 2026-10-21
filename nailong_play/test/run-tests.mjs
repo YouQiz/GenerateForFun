@@ -378,6 +378,42 @@ async function pageDeepPhase() {
   await wait(300);
   ok('custom reapplied', s.templateId === 'custom');
 
+  /* --- 6.7 手势控制：双手手指 → 自选框 --- */
+  const handCv = document.createElement('canvas');
+  handCv.width = 480;
+  handCv.height = 360;
+  const hg = handCv.getContext('2d');
+  hg.fillStyle = '#232833';
+  hg.fillRect(0, 0, 480, 360);
+  hg.fillStyle = '#e8b48f';
+  hg.beginPath(); hg.roundRect(90, 250, 40, 62, 16); hg.fill();
+  hg.beginPath(); hg.roundRect(103, 196, 16, 62, 8); hg.fill();
+  hg.beginPath(); hg.roundRect(350, 250, 40, 62, 16); hg.fill();
+  hg.beginPath(); hg.roundRect(363, 196, 16, 62, 8); hg.fill();
+
+  const ht = NF.createHandTracker();
+  const hr = ht.analyze(handCv, null, false);
+  ok('hand tracker finds two hands', hr.hands.length === 2,
+    'n=' + hr.hands.length + ' ' + JSON.stringify(hr.hands.map((h) => [+h.x.toFixed(2), +h.y.toFixed(2)])));
+  ok('hand span computed', !!hr.dual && hr.dual.span > 0.35, hr.dual ? hr.dual.span.toFixed(2) : 'null');
+
+  document.getElementById('btn-hand').click();
+  await wait(1500);
+  ok('hand mode enabled', s.handControl === true);
+  ok('demo hands detected', s.hands.length === 2, 'n=' + s.hands.length);
+  if (s.hands.length === 2) {
+    const mx = (s.hands[0].x + s.hands[1].x) / 2;
+    const my = (s.hands[0].y + s.hands[1].y) / 2;
+    const qx = s.quad.reduce((a, p) => a + p.x, 0) / 4;
+    const qy = s.quad.reduce((a, p) => a + p.y, 0) / 4;
+    out.handDebug = { mx: +mx.toFixed(2), my: +my.toFixed(2), qx: +qx.toFixed(2), qy: +qy.toFixed(2) };
+    ok('quad follows hands', Math.abs(qx - mx) < 0.12 && Math.abs(qy - my) < 0.16,
+      'quad=' + qx.toFixed(2) + ',' + qy.toFixed(2) + ' hands=' + mx.toFixed(2) + ',' + my.toFixed(2));
+  }
+  document.getElementById('btn-hand').click();
+  await wait(400);
+  ok('hand mode disabled', s.handControl === false);
+
   /* --- 7. 切换换脸面板 --- */
   document.getElementById('btn-switch').click();
   await wait(300);
@@ -636,6 +672,21 @@ try {
   await sleep(300);
   console.log('     截图:', await screenshot(cdp, '03-after-close'));
 
+  // 手势控制截图
+  const handPhase = await evaluate(cdp, `(async () => {
+    const NF = window.__nailong_play;
+    document.getElementById('btn-hand').click();
+    await new Promise((r) => setTimeout(r, 1600));
+    return { on: NF.state.handControl, hands: NF.state.hands.length };
+  })()`);
+  const rh = report({
+    '手势模式截图：已开启': { pass: handPhase.on === true },
+    '手势模式截图：检测到双手': { pass: handPhase.hands === 2, extra: 'n=' + handPhase.hands },
+  });
+  console.log('     截图:', await screenshot(cdp, '10-hand-control'));
+  await evaluate(cdp, `document.getElementById('btn-hand').click(); true`);
+  await sleep(250);
+
   // 打开作品库截图
   await evaluate(cdp, `document.getElementById('btn-works').click(); true`);
   await sleep(500);
@@ -711,8 +762,8 @@ try {
   console.log('     截图:', await screenshot(denied.cdp, '09-permission-denied'));
 
   const total = {
-    pass: ra.pass + rb.pass + rc.pass + rd.pass + rl.pass + re.pass,
-    fail: ra.fail + rb.fail + rc.fail + rd.fail + rl.fail + re.fail,
+    pass: ra.pass + rb.pass + rc.pass + rd.pass + rl.pass + re.pass + rh.pass,
+    fail: ra.fail + rb.fail + rc.fail + rd.fail + rl.fail + re.fail + rh.fail,
   };
   console.log(`\n=== 汇总：${total.pass} 通过 / ${total.fail} 失败 ===`);
   if (total.fail) exitCode = 1;
